@@ -13,5 +13,6 @@ Ported from https://github.com/SlightlyMad/SimpleDxrPathTracer
 
 ## Requirements
 * Unity 2019.3b2 or newer
+* Created with URP 14.0.11
 * DXR compatible graphics card (NVidia RTX series or some cars from NVidia GeForce 10 and 16 series)
 * Windows 10 (v1809 or newer)
