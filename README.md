@@ -1,6 +1,6 @@
 # DXR PathTracer in Unity
-![Alt text](Screenshot1.png?raw=true "Preview 1")
-![Alt text](Screenshot2.png?raw=true "Preview 2")
+![Alt text](screenshots/Screenshot1.png?raw=true "Preview 1")
+![Alt text](screenshots/Screenshot2.png?raw=true "Preview 2")
 
 Simple PathTracer implemented in Unity and powered by DXR. You can see it as an example how to use DXR API/shaders in Unity.
 * Dead simple. Only few hundred lines of code. No Monte Carlo integration, no probability distribution functions, no importance sampling, no denoising. It should be easy to follow (assuming you know what a path-tracer is)
