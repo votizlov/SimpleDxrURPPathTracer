@@ -3,6 +3,7 @@
 	Properties
 	{
 		_Color ("Color", Color) = (1, 1, 1, 1)
+        _MainTex ("Camera Color", 2D) = "white" {}
 	}
 	SubShader
 	{
@@ -26,12 +27,16 @@
 			Tags{ "LightMode" = "DxrPass" }
 
 			HLSLPROGRAM
+			#pragma shader_target 6_5
 
 			#pragma raytracing test
 					   
 			#include "Common.cginc"
 
 			float4 _Color;
+            Texture2D<float4> _MainTex;
+            float4 _MainTex_ST;
+			SamplerState sampler_MainTex;
 
 			[shader("closesthit")]
 			void ClosestHit(inout RayPayload rayPayload : SV_RayPayload, AttributeData attributeData : SV_IntersectionAttributes)
@@ -49,6 +54,7 @@
 				// transform normal to world space
 				float3x3 objectToWorld = (float3x3)ObjectToWorld3x4();
 				float3 worldNormal = normalize(mul(objectToWorld, currentvertex.normalOS));
+                float2 uv =currentvertex.texCoord0;
 								
 				float3 rayOrigin = WorldRayOrigin();
 				float3 rayDir = WorldRayDirection();
@@ -76,7 +82,7 @@
 				// shoot scattered ray
 				TraceRay(_RaytracingAccelerationStructure, RAY_FLAG_NONE, RAYTRACING_OPAQUE_FLAG, 0, 1, 0, rayDesc, scatterRayPayload);
 				
-				rayPayload.color = _Color.xyz * scatterRayPayload.color;
+				rayPayload.color = _Color.xyz * _MainTex.SampleLevel(sampler_MainTex,uv,0) * scatterRayPayload.color;
 			}			
 
 			ENDHLSL
