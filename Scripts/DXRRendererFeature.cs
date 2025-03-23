@@ -1,258 +1,211 @@
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Rendering.RenderGraphModule;
+using UnityEngine.Rendering.RenderGraphModule.Util;
 using UnityEngine.Rendering.Universal;
-using UnityEngine.Experimental.Rendering;
-using System.Collections.Generic;
 
 public class DXRRendererFeature : ScriptableRendererFeature
 {
-    [System.Serializable]
-    public class DXRSettings
+    public class DXRTracePass : ScriptableRenderPass
     {
-        public Color skyColor = Color.blue;
-        public Color groundColor = Color.gray;
-        public RenderPassEvent renderPassEvent = RenderPassEvent.BeforeRenderingPostProcessing;
-        public RayTracingShader rayTracingShader;
-    }
+        [System.Serializable]
+        public class DXRSettings
+        {
+            public Color skyColor = Color.blue;
+            public Color groundColor = Color.gray;
+            public RayTracingShader rayTracingShader;
+            public RenderPassEvent renderPassEvent = RenderPassEvent.BeforeRenderingPostProcessing;
+        }
 
-    public DXRSettings settings = new DXRSettings();
-
-    class DXRRenderPass : ScriptableRenderPass
-    {
-        private string profilerTag;
         private DXRSettings settings;
-        private RenderTargetIdentifier cameraColorTarget;
-        private RenderTargetHandle dxrTargetHandle;
-        private RenderTargetHandle accumulationTarget1Handle;
-        private RenderTargetHandle accumulationTarget2Handle;
-        private RenderTexture dxrTarget;
-        private RenderTexture accumulationTarget1;
-        private RenderTexture accumulationTarget2;
-        private Material accumulationMaterial;
-        private RayTracingAccelerationStructure rtas;
-        private RayTracingShader rayTracingShader;
+        private RayTracingAccelerationStructure _rtas;
+        private Material _accumulationMaterial;
         private int frameIndex;
+        private bool pingPong;
+        private RTHandle accumulationTarget1;
+        private RTHandle accumulationTarget2;
         private Matrix4x4 lastCameraWorldMatrix;
-        private bool rtasInitialized = false;
-        private bool texturesInitialized = false;
-
-        public DXRRenderPass(string tag, DXRSettings settings)
+        class TracePassData
         {
-            this.profilerTag = tag;
+            public RayTracingShader RayTracingShader;
+            public RayTracingAccelerationStructure RTAS;
+            public uint width;
+            public uint height;
+            public Camera Camera;
+            public TextureHandle DXRTarget;
+            public Vector3 bottomLeft;
+            public Vector3 topLeft;
+            public Vector3 bottomRight;
+            public Vector3 topRight;
+            public int frameIndex;
+            public Vector4 skyColor;
+            public Vector4 groundColor;
+        }
+
+        class AccumulatePassData
+        {
+            public Material accumulationMaterial;
+            public TextureHandle sourceTex;
+            public int frameIndex;
+            public bool pingPong;
+            public TextureHandle accumulationTarget1;
+            public TextureHandle accumulationTarget2;
+        }
+
+        public DXRTracePass(DXRSettings settings)
+        {
             this.settings = settings;
-            this.renderPassEvent = settings.renderPassEvent;
-            
-            dxrTargetHandle.Init("_DXRTarget");
-            accumulationTarget1Handle.Init("_AccumulationTarget1");
-            accumulationTarget2Handle.Init("_AccumulationTarget2");
-            
-            frameIndex = 0;
-            
-            accumulationMaterial = new Material(Shader.Find("Hidden/Accumulation"));
-            
-            rayTracingShader = settings.rayTracingShader;
-            if (rayTracingShader == null)
-            {
-                Debug.LogError("RayTracingShader not assigned in DXR Renderer Feature settings");
-            }
+            settings.rayTracingShader.SetShaderPass("DxrPass");
+            _accumulationMaterial = new Material(Shader.Find("Hidden/Accumulation"));
+            InitRTAS();
+            settings.rayTracingShader.SetAccelerationStructure("_RaytracingAccelerationStructure",_rtas);
         }
-
-        public override void Configure(CommandBuffer cmd, RenderTextureDescriptor cameraTextureDescriptor)
-        {
-            RenderTextureDescriptor dxrDesc = cameraTextureDescriptor;
-            dxrDesc.colorFormat = RenderTextureFormat.ARGBFloat;
-            dxrDesc.depthBufferBits = 0;
-            dxrDesc.msaaSamples = 1;
-            dxrDesc.enableRandomWrite = true;
-            
-            if (dxrTarget == null || dxrTarget.width != cameraTextureDescriptor.width || dxrTarget.height != cameraTextureDescriptor.height)
-            {
-                if (dxrTarget != null)
-                {
-                    dxrTarget.Release();
-                    accumulationTarget1.Release();
-                    accumulationTarget2.Release();
-                }
-                
-                dxrTarget = new RenderTexture(dxrDesc);
-                dxrTarget.Create();
-                
-                accumulationTarget1 = new RenderTexture(dxrDesc);
-                accumulationTarget1.Create();
-                
-                accumulationTarget2 = new RenderTexture(dxrDesc);
-                accumulationTarget2.Create();
-                
-                cmd.SetGlobalTexture(dxrTargetHandle.id, dxrTarget);
-                cmd.SetGlobalTexture(accumulationTarget1Handle.id, accumulationTarget1);
-                cmd.SetGlobalTexture(accumulationTarget2Handle.id, accumulationTarget2);
-                
-                texturesInitialized = true;
-                
-                if (rtasInitialized && rayTracingShader != null)
-                {
-                    rayTracingShader.SetTexture("_DxrTarget", dxrTarget);
-                }
-            }
-        }
-
-        public override void OnCameraSetup(CommandBuffer cmd, ref RenderingData renderingData)
-        {
-            cameraColorTarget = renderingData.cameraData.renderer.cameraColorTarget;
-            
-            if (!rtasInitialized && texturesInitialized)
-            {
-                InitRaytracingAccelerationStructure();
-                rtasInitialized = true;
-            }
-            
-            if (rtasInitialized)
-            {
-                Camera camera = renderingData.cameraData.camera;
-                if (lastCameraWorldMatrix != camera.transform.localToWorldMatrix)
-                {
-                    UpdateParameters(cmd, camera);
-                    lastCameraWorldMatrix = camera.transform.localToWorldMatrix;
-                }
-            }
-        }
-
-        private void InitRaytracingAccelerationStructure()
+        private void InitRTAS()
         {
             if (!SystemInfo.supportsRayTracing)
-            {
-                Debug.LogError("This device does not support raytracing");
                 return;
-            }
 
-            RayTracingAccelerationStructure.RASSettings settings = new RayTracingAccelerationStructure.RASSettings();
-            // Include all layers
-            settings.layerMask = ~0;
-            // Enable automatic updates
-            settings.managementMode = RayTracingAccelerationStructure.ManagementMode.Automatic;
-            // Include all renderer types
-            settings.rayTracingModeMask = RayTracingAccelerationStructure.RayTracingModeMask.Everything;
+            RayTracingAccelerationStructure.Settings rtasSettings = new RayTracingAccelerationStructure.Settings
+            {
+                managementMode = RayTracingAccelerationStructure.ManagementMode.Automatic,
+                rayTracingModeMask = RayTracingAccelerationStructure.RayTracingModeMask.Everything,
+                layerMask = 1 << LayerMask.NameToLayer("Default")
+            };
 
-            rtas = new RayTracingAccelerationStructure(settings);
-            
-            // Collect all objects in scene and add them to raytracing scene
+            _rtas = new RayTracingAccelerationStructure(rtasSettings);
+
             Renderer[] renderers = Object.FindObjectsOfType<Renderer>();
+            RayTracingSubMeshFlags[ ] subMeshFlags = { RayTracingSubMeshFlags.Enabled | RayTracingSubMeshFlags.ClosestHitOnly };
             foreach(Renderer r in renderers)
-                rtas.AddInstance(r);
-
-            // Build raytracing scene
-            rtas.Build();
-            
-            rayTracingShader.SetAccelerationStructure("_RaytracingAccelerationStructure", rtas);
-            // Now it's safe to set the texture since we know it's initialized
-            rayTracingShader.SetTexture("_DxrTarget", dxrTarget);
-            rayTracingShader.SetShaderPass("DxrPass");
+               _rtas.AddInstance(r, subMeshFlags, false);
+            _rtas.Build();
         }
 
-        private void UpdateParameters(CommandBuffer cmd, Camera camera)
+        public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
         {
-            // Update raytracing scene, in case something moved
-            rtas.Build();
+            UniversalResourceData resourceData = frameData.Get<UniversalResourceData>();
+            UniversalCameraData cameraData = frameData.Get<UniversalCameraData>();
 
-            // Frustum corners for current camera transform
+            var source = resourceData.activeColorTexture;
+            var destinationDesc = renderGraph.GetTextureDesc(source);
+            destinationDesc.enableRandomWrite = true;
+            destinationDesc.name = "DXRTarget";
+            TextureHandle buffer = renderGraph.CreateTexture(destinationDesc);
+
+            var camera = cameraData.camera;
+
+            int width = camera.pixelWidth;
+            int height = camera.pixelHeight;
             Vector3 bottomLeft = camera.ViewportToWorldPoint(new Vector3(0, 0, camera.farClipPlane)).normalized;
             Vector3 topLeft = camera.ViewportToWorldPoint(new Vector3(0, 1, camera.farClipPlane)).normalized;
             Vector3 bottomRight = camera.ViewportToWorldPoint(new Vector3(1, 0, camera.farClipPlane)).normalized;
             Vector3 topRight = camera.ViewportToWorldPoint(new Vector3(1, 1, camera.farClipPlane)).normalized;
 
-            // Update camera, environment parameters
-            rayTracingShader.SetVector("_SkyColor", settings.skyColor.gamma);
-            rayTracingShader.SetVector("_GroundColor", settings.groundColor.gamma);
+            if (lastCameraWorldMatrix != camera.transform.localToWorldMatrix)
+            {
+                // Reset accumulation frame counter
+                frameIndex = 0;
+                lastCameraWorldMatrix = camera.transform.localToWorldMatrix;
+            }
 
-            rayTracingShader.SetVector("_TopLeftFrustumDir", topLeft);
-            rayTracingShader.SetVector("_TopRightFrustumDir", topRight);
-            rayTracingShader.SetVector("_BottomLeftFrustumDir", bottomLeft);
-            rayTracingShader.SetVector("_BottomRightFrustumDir", bottomRight);
+            using (var builder = renderGraph.AddComputePass<TracePassData>(passName, out var passData))
+            {
+                passData.RayTracingShader = settings.rayTracingShader;
+                passData.Camera = cameraData.camera;
+                passData.DXRTarget = buffer;
+                passData.width = (uint)width;
+                passData.height = (uint)height;
 
-            rayTracingShader.SetVector("_CameraPos", camera.transform.position);
+                passData.bottomLeft = bottomLeft;
+                passData.topLeft = topLeft;
+                passData.bottomRight = bottomRight;
+                passData.topRight = topRight;
+                passData.frameIndex = frameIndex++;
 
-            // Reset accumulation frame counter
-            frameIndex = 0;
+                passData.skyColor = settings.skyColor.linear;
+                passData.groundColor = settings.groundColor.linear;
+
+                builder.UseTexture(passData.DXRTarget);
+
+                builder.AllowPassCulling(false);
+
+                builder.SetRenderFunc((TracePassData data, ComputeGraphContext cgContext)
+                    => ExecuteTracePass(data, cgContext));
+            }
+
+            RenderTextureDescriptor textureProperties = new RenderTextureDescriptor(width, height,
+                RenderTextureFormat.Default, 0);
+
+            RenderingUtils.ReAllocateIfNeeded(ref accumulationTarget1, textureProperties, FilterMode.Bilinear,
+                TextureWrapMode.Clamp, name: "accumulation1" );
+            TextureHandle accumulationTex1 = renderGraph.ImportTexture(accumulationTarget1);
+
+            RenderingUtils.ReAllocateIfNeeded(ref accumulationTarget2, textureProperties, FilterMode.Bilinear,
+                TextureWrapMode.Clamp, name: "accumulation2" );
+            TextureHandle accumulationTex2 = renderGraph.ImportTexture(accumulationTarget2);
+
+            using (var builder = renderGraph.AddRasterRenderPass("DXR accumulate", out AccumulatePassData passData))
+            {
+                passData.accumulationMaterial = _accumulationMaterial;
+                passData.pingPong = pingPong;
+                passData.sourceTex = buffer;
+                passData.accumulationTarget1 = accumulationTex1;
+                passData.accumulationTarget2 = accumulationTex2;
+                passData.frameIndex = frameIndex;
+
+                builder.AllowPassCulling(false);
+                builder.UseTexture(pingPong?accumulationTex1:accumulationTex2);
+                builder.UseTexture(buffer);
+                builder.SetRenderAttachment(pingPong?accumulationTex2:accumulationTex1,0);
+
+                builder.SetRenderFunc((AccumulatePassData data, RasterGraphContext rgContext) =>
+                {
+                    ExecuteAccumulatePass(data, rgContext);
+                });
+            }
+            if (_accumulationMaterial == null)
+            {
+                _accumulationMaterial = new Material(Shader.Find("Hidden/Accumulation"));
+            }
+            resourceData.cameraColor = pingPong?accumulationTex2:accumulationTex1;
+            pingPong = !pingPong;
         }
 
-        public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
+        static void ExecuteTracePass(TracePassData data, ComputeGraphContext context)
         {
-            if (!SystemInfo.supportsRayTracing || rtas == null || rayTracingShader == null || !texturesInitialized)
-                return;
-
-            CommandBuffer cmd = CommandBufferPool.Get(profilerTag);
-            
-            // Update frame index and start path tracer
-            rayTracingShader.SetInt("_FrameIndex", frameIndex);
-            
-            Camera camera = renderingData.cameraData.camera;
-            rayTracingShader.Dispatch("MyRaygenShader", camera.pixelWidth, camera.pixelHeight, 1, camera);
-            
-            cmd.SetGlobalTexture("_CurrentFrame", dxrTarget);
-            cmd.SetGlobalTexture("_Accumulation", accumulationTarget1);
-            cmd.SetGlobalInt("_FrameIndex", frameIndex++);
-            
-            // Accumulate current raytracing result
-            cmd.Blit(dxrTarget, accumulationTarget2, accumulationMaterial);
-            
-            // Blit the accumulated result to the camera target
-            cmd.Blit(accumulationTarget2, cameraColorTarget);
-            
-            // Switch accumulation textures for next frame
-            RenderTexture temp = accumulationTarget1;
-            accumulationTarget1 = accumulationTarget2;
-            accumulationTarget2 = temp;
-            
-            context.ExecuteCommandBuffer(cmd);
-            CommandBufferPool.Release(cmd);
+            context.cmd.SetRayTracingVectorParam(data.RayTracingShader,"_TopLeftFrustumDir",data.topLeft);
+            context.cmd.SetRayTracingVectorParam(data.RayTracingShader,"_TopRightFrustumDir",data.topRight);
+            context.cmd.SetRayTracingVectorParam(data.RayTracingShader,"_BottomLeftFrustumDir",data.bottomLeft);
+            context.cmd.SetRayTracingVectorParam(data.RayTracingShader,"_BottomRightFrustumDir",data.bottomRight);
+            context.cmd.SetRayTracingVectorParam(data.RayTracingShader,"_CameraPos",data.Camera.transform.position);
+            context.cmd.SetRayTracingVectorParam(data.RayTracingShader,"_SkyColor",data.skyColor);
+            context.cmd.SetRayTracingVectorParam(data.RayTracingShader,"_GroundColor",data.groundColor);
+            context.cmd.SetRayTracingTextureParam(data.RayTracingShader,"_DxrTarget", data.DXRTarget);
+            context.cmd.SetRayTracingIntParam(data.RayTracingShader,"_FrameIndex", data.frameIndex);
+            context.cmd.DispatchRays(data.RayTracingShader,"MyRaygenShader",data.width,data.height,1,data.Camera);
         }
 
-        public override void FrameCleanup(CommandBuffer cmd)
+        static void ExecuteAccumulatePass(AccumulatePassData data, RasterGraphContext context)
         {
-            
-        }
-        
-        public void Cleanup()
-        {
-            if (rtas != null)
-                rtas.Release();
-                
-            if (dxrTarget != null)
-                dxrTarget.Release();
-                
-            if (accumulationTarget1 != null)
-                accumulationTarget1.Release();
-                
-            if (accumulationTarget2 != null)
-                accumulationTarget2.Release();
+            data.accumulationMaterial.SetTexture("_CurrentFrame", data.sourceTex);
+            data.accumulationMaterial.SetTexture("_Accumulation", data.pingPong?data.accumulationTarget1:data.accumulationTarget2);
+            data.accumulationMaterial.SetInt("_FrameIndex", data.frameIndex);
+            Blitter.BlitTexture(context.cmd,data.sourceTex,new Vector4(1,1),data.accumulationMaterial,0);
         }
     }
-
-    private DXRRenderPass dxrRenderPass;
+    DXRTracePass customPass;
+    public DXRTracePass.DXRSettings settings = new DXRTracePass.DXRSettings();
 
     public override void Create()
     {
-        dxrRenderPass = new DXRRenderPass("DXR Render Pass", settings);
+        if(settings.rayTracingShader == null) return;
+        customPass = new DXRTracePass(settings);
+        customPass.renderPassEvent = RenderPassEvent.AfterRenderingPostProcessing;
     }
 
     public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
     {
-        if (SystemInfo.supportsRayTracing && settings.rayTracingShader != null)
-        {
-            renderer.EnqueuePass(dxrRenderPass);
-        }
-        else
-        {
-            Debug.LogWarning("DXR Renderer Feature: Raytracing not supported on this device or RayTracingShader not assigned.");
-        }
-    }
-    
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            dxrRenderPass.Cleanup();
-        }
-        base.Dispose(disposing);
+        if(settings.rayTracingShader == null) return;
+        renderer.EnqueuePass(customPass);
     }
 }

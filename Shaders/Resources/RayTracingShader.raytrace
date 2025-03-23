@@ -16,6 +16,15 @@ float3 _CameraPos;
 int _RaysPerPixel;
 int _FrameIndex;
 
+struct Surfel
+{
+    float3 position;
+    float3 normal;
+};
+
+RWStructuredBuffer<Surfel> gSurfelBuffer;
+RWByteAddressBuffer gSurfelCounter;
+
 #pragma max_recursion_depth 8
 
 [shader("raygeneration")]
@@ -27,7 +36,7 @@ void MyRaygenShader()
 	uint2 dispatchIdx = DispatchRaysIndex().xy;
 	// target resolution
 	uint2 launchDim = DispatchRaysDimensions().xy;
-	
+
 	// init random seed from current pixel location and frame index
 	uint seed = initRand(dispatchIdx.x + dispatchIdx.y * launchDim.x, _FrameIndex);
 	//uint seed = initRand((dispatchIdx.x + dispatchIdx.y * launchDim.x) * _FrameIndex * 2);
@@ -35,7 +44,7 @@ void MyRaygenShader()
 	// get random uv inside current pixel
 	// this will give us anti-aliasing for free
 	float2 uv = ((float2)dispatchIdx + float2(nextRand(seed), nextRand(seed))) / (float2)launchDim;
-	
+
 	// translate screen uv to ray direction
 	float3 topHorizontalRayDir = lerp(_TopLeftFrustumDir, _TopRightFrustumDir, uv.x);
 	float3 bottomHorizontalRayDir = lerp(_BottomLeftFrustumDir, _BottomRightFrustumDir, uv.x);
@@ -58,8 +67,8 @@ void MyRaygenShader()
 	TraceRay(_RaytracingAccelerationStructure, RAY_FLAG_NONE, RAYTRACING_OPAQUE_FLAG, 0, 1, 0, rayDesc, rayPayload);
 
 	// store result
-	float3 color = rayPayload.color;	   
-	_DxrTarget[dispatchIdx] = float4(color, 1);	
+	float3 color = rayPayload.color;
+	_DxrTarget[dispatchIdx] = float4(color, 1);
 }
 
 /* "back up" closest hit shader. it is used when we hit material without raytracing shader pass
@@ -76,5 +85,5 @@ void MissShader(inout RayPayload rayPayload : SV_RayPayload)
 {
 	// return gradient background color
 	float3 rayDir = WorldRayDirection();
-	rayPayload.color = lerp(_GroundColor, _SkyColor, rayDir.y * 0.5 + 0.5);	
+	rayPayload.color = lerp(_GroundColor, _SkyColor, rayDir.y * 0.5 + 0.5);
 }
